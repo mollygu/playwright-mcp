@@ -16,6 +16,7 @@
 
 import os from 'os';
 import path from 'path';
+import fs from 'fs/promises';
 
 import { z } from 'zod';
 import { zodToJsonSchema } from 'zod-to-json-schema';
@@ -24,8 +25,48 @@ import { captureAriaSnapshot, runAndWait, sanitizeForFilePath } from './utils';
 
 import type { ToolFactory, Tool } from './tool';
 
+
+const saveCookiesSchema = z.object({
+  cookiesPath: z.string().describe('The path to save the cookies.json file'),
+});
+
+export const saveCookies: Tool = {
+  schema: {
+    name: 'browser_save_cookies',
+    description: 'Save the cookies to a file',
+    inputSchema: zodToJsonSchema(saveCookiesSchema)
+  },
+  handle: async (context, params) => {
+    try {
+      const validatedParams = saveCookiesSchema.parse(params);
+      const page = await context.createPage();
+  
+      const cookies = await page.context().cookies();
+  
+      const savedCookiesPath = path.resolve(validatedParams.cookiesPath);
+      await fs.writeFile(savedCookiesPath, JSON.stringify(cookies, null, 2));
+  
+      return {
+        content: [{
+          type: 'text',
+          text: `Cookies saved to ${savedCookiesPath}`,
+        }],
+      };
+    } catch (err) {
+      return {
+        content: [{
+          type: 'text',
+          text: `Failed to save cookies: ${err}`,
+        }],
+        isError: true,
+      };
+    }
+  },
+};
+
 const navigateSchema = z.object({
   url: z.string().describe('The URL to navigate to'),
+  cookiesPath: z.string().optional().describe('[Optional] The path to the cookies.json file'),
 });
 
 export const navigate: ToolFactory = snapshot => ({
@@ -37,6 +78,24 @@ export const navigate: ToolFactory = snapshot => ({
   handle: async (context, params) => {
     const validatedParams = navigateSchema.parse(params);
     const page = await context.createPage();
+    
+    if (validatedParams.cookiesPath) {
+      try {
+        const cookies = JSON.parse(
+          await fs.readFile(validatedParams.cookiesPath, 'utf-8')
+        );
+        await page.context().addCookies(cookies);
+      } catch (err) {
+        return {
+          content: [{
+            type: 'text',
+            text: `Failed to load cookies from ${validatedParams.cookiesPath}: ${err}`,
+          }],
+          isError: true,
+        };
+      }
+    }
+    
     await page.goto(validatedParams.url, { waitUntil: 'domcontentloaded' });
     // Cap load event to 5 seconds, the page is operational at this point.
     await page.waitForLoadState('load', { timeout: 5000 }).catch(() => {});
@@ -50,6 +109,33 @@ export const navigate: ToolFactory = snapshot => ({
     };
   },
 });
+
+// const navigateSchema = z.object({
+//   url: z.string().describe('The URL to navigate to'),
+// });
+
+// export const navigate: ToolFactory = snapshot => ({
+//   schema: {
+//     name: 'browser_navigate',
+//     description: 'Navigate to a URL',
+//     inputSchema: zodToJsonSchema(navigateSchema),
+//   },
+//   handle: async (context, params) => {
+//     const validatedParams = navigateSchema.parse(params);
+//     const page = await context.createPage();
+//     await page.goto(validatedParams.url, { waitUntil: 'domcontentloaded' });
+//     // Cap load event to 5 seconds, the page is operational at this point.
+//     await page.waitForLoadState('load', { timeout: 5000 }).catch(() => {});
+//     if (snapshot)
+//       return captureAriaSnapshot(context);
+//     return {
+//       content: [{
+//         type: 'text',
+//         text: `Navigated to ${validatedParams.url}`,
+//       }],
+//     };
+//   },
+// });
 
 const goBackSchema = z.object({});
 

@@ -233,6 +233,16 @@ The Playwright MCP provides a set of tools for browser automation. Here are all 
   - Description: Capture accessibility snapshot of the current page (better than screenshot)
   - Parameters: None
 
+- **browser_take_html_snippet**
+  - Description: Retrieve the HTML content of the current page or a specific element
+  - Parameters:
+    - `element` (string, optional): Human-readable element description used to obtain permission to interact with the element
+    - `ref` (string, optional): Exact target element reference from the page snapshot
+    - `includeOuter` (boolean, optional): Whether to include the outer HTML of the selected element. Default is false.
+    - `filterTags` (array, optional): List of HTML tag names to filter out from the result. Default removes meta, script, style, and link tags.
+  - Response:
+    - Returns formatted, indented HTML with syntax highlighting for better readability
+
 - **browser_save_as_pdf**
   - Description: Save page as PDF
   - Parameters: None
@@ -308,6 +318,16 @@ Vision Mode provides tools for visual-based interactions using screenshots. Here
   - Description: Choose one or multiple files to upload
   - Parameters:
     - `paths` (array): The absolute paths to the files to upload. Can be a single file or multiple files.
+
+- **browser_take_html_snippet**
+  - Description: Retrieve the HTML content of the current page or a specific element
+  - Parameters:
+    - `element` (string, optional): Human-readable element description used to obtain permission to interact with the element
+    - `ref` (string, optional): Exact target element reference from the page snapshot
+    - `includeOuter` (boolean, optional): Whether to include the outer HTML of the selected element. Default is false.
+    - `filterTags` (array, optional): List of HTML tag names to filter out from the result. Default removes meta, script, style, and link tags.
+  - Response:
+    - Returns formatted, indented HTML with syntax highlighting for better readability
 
 - **browser_save_as_pdf**
   - Description: Save page as PDF

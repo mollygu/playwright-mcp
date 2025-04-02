@@ -31,6 +31,7 @@ const commonTools: Tool[] = [
   common.pdf,
   common.close,
   common.install,
+  common.saveCookies,
 ];
 
 const snapshotTools: Tool[] = [
@@ -81,7 +82,6 @@ export function createServer(options?: Options): Server {
     version: packageJSON.version,
     tools,
     resources,
-    browserName: options?.browserName,
     userDataDir: options?.userDataDir ?? '',
     launchOptions: options?.launchOptions,
     cdpEndpoint: options?.cdpEndpoint,
