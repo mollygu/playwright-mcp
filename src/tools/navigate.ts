@@ -16,6 +16,8 @@
 
 import { z } from 'zod';
 import { defineTool, type ToolFactory } from './tool.js';
+import path from 'path';
+import fs from 'fs/promises';
 
 const navigate: ToolFactory = captureSnapshot => defineTool({
   capability: 'core',
@@ -26,18 +28,57 @@ const navigate: ToolFactory = captureSnapshot => defineTool({
     description: 'Navigate to a URL',
     inputSchema: z.object({
       url: z.string().describe('The URL to navigate to'),
+      cookiesPath: z.string().optional().describe('Optional path to a cookies.json file to load before navigation'),
     }),
     type: 'destructive',
   },
 
   handle: async (context, params) => {
     const tab = await context.ensureTab();
+    const code = [];
+    
+    // Load cookies if a path is provided
+    if (params.cookiesPath) {
+      try {
+        const cookiesPath = path.resolve(params.cookiesPath);
+        const cookiesJson = await fs.readFile(cookiesPath, 'utf-8');
+        const cookiesData = JSON.parse(cookiesJson);
+        
+        // Handle both formats: direct array or object with 'cookies' property
+        const cookies = "cookies" in cookiesData ? cookiesData.cookies : cookiesData;
+        
+        await tab.page.context().addCookies(cookies);
+        
+        code.push(
+          `// Load cookies from ${params.cookiesPath}`,
+          `const cookiesJson = fs.readFileSync('${params.cookiesPath}', 'utf-8');`,
+          `const cookiesData = JSON.parse(cookiesJson);`,
+          `// Handle both formats: direct array or object with 'cookies' property`,
+          `const cookies = cookiesData.cookies ? cookiesData.cookies : cookiesData;`,
+          `await context.addCookies(cookies);`
+        );
+      } catch (err) {
+        return {
+          resultOverride: {
+            content: [{
+              type: 'text',
+              text: `Failed to load cookies from ${params.cookiesPath}: ${err}`
+            }]
+          },
+          code: [],
+          captureSnapshot,
+          waitForNetwork: false,
+        };
+      }
+    }
+    
+    // Navigate to the URL
     await tab.navigate(params.url);
-
-    const code = [
+    
+    code.push(
       `// Navigate to ${params.url}`,
-      `await page.goto('${params.url}');`,
-    ];
+      `await page.goto('${params.url}');`
+    );
 
     return {
       code,
