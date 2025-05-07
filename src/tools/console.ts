@@ -14,22 +14,34 @@
  * limitations under the License.
  */
 
-import type { Resource } from './resource';
+import { z } from 'zod';
+import { defineTool } from './tool.js';
 
-export const console: Resource = {
+const console = defineTool({
+  capability: 'core',
   schema: {
-    uri: 'browser://console',
-    name: 'Page console',
-    mimeType: 'text/plain',
+    name: 'browser_console_messages',
+    title: 'Get console messages',
+    description: 'Returns all console messages',
+    inputSchema: z.object({}),
+    type: 'readOnly',
   },
-
-  read: async (context, uri) => {
-    const messages = await context.console();
+  handle: async context => {
+    const messages = context.currentTabOrDie().console();
     const log = messages.map(message => `[${message.type().toUpperCase()}] ${message.text()}`).join('\n');
-    return [{
-      uri,
-      mimeType: 'text/plain',
-      text: log
-    }];
+    return {
+      code: [`// <internal code to get console messages>`],
+      action: async () => {
+        return {
+          content: [{ type: 'text', text: log }]
+        };
+      },
+      captureSnapshot: false,
+      waitForNetwork: false,
+    };
   },
-};
+});
+
+export default [
+  console,
+];

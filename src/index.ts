@@ -14,76 +14,10 @@
  * limitations under the License.
  */
 
-import { createServerWithTools } from './server';
-import * as snapshot from './tools/snapshot';
-import * as common from './tools/common';
-import * as screenshot from './tools/screenshot';
-import { console } from './resources/console';
+import { Connection } from './connection.js';
 
-import type { Tool } from './tools/tool';
-import type { Resource } from './resources/resource';
-import type { Server } from '@modelcontextprotocol/sdk/server/index.js';
-import type { LaunchOptions } from 'playwright';
+import type { Config } from '../config.js';
 
-const commonTools: Tool[] = [
-  common.pressKey,
-  common.wait,
-  common.pdf,
-  common.close,
-  common.install,
-];
-
-const snapshotTools: Tool[] = [
-  common.navigate(true),
-  common.goBack(true),
-  common.goForward(true),
-  common.chooseFile(true),
-  snapshot.snapshot,
-  snapshot.click,
-  snapshot.hover,
-  snapshot.type,
-  snapshot.selectOption,
-  snapshot.screenshot,
-  ...commonTools,
-];
-
-const screenshotTools: Tool[] = [
-  common.navigate(false),
-  common.goBack(false),
-  common.goForward(false),
-  common.chooseFile(false),
-  screenshot.screenshot,
-  screenshot.moveMouse,
-  screenshot.click,
-  screenshot.drag,
-  screenshot.type,
-  ...commonTools,
-];
-
-const resources: Resource[] = [
-  console,
-];
-
-type Options = {
-  browserName?: 'chromium' | 'firefox' | 'webkit';
-  userDataDir?: string;
-  launchOptions?: LaunchOptions;
-  cdpEndpoint?: string;
-  vision?: boolean;
-};
-
-const packageJSON = require('../package.json');
-
-export function createServer(options?: Options): Server {
-  const tools = options?.vision ? screenshotTools : snapshotTools;
-  return createServerWithTools({
-    name: 'Playwright',
-    version: packageJSON.version,
-    tools,
-    resources,
-    browserName: options?.browserName,
-    userDataDir: options?.userDataDir ?? '',
-    launchOptions: options?.launchOptions,
-    cdpEndpoint: options?.cdpEndpoint,
-  });
+export async function createConnection(config: Config = {}): Promise<Connection> {
+  return createConnection(config);
 }

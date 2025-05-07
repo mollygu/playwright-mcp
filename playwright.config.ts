@@ -16,12 +16,20 @@
 
 import { defineConfig } from '@playwright/test';
 
-export default defineConfig({
+import type { TestOptions } from './tests/fixtures.js';
+
+export default defineConfig<TestOptions>({
   testDir: './tests',
   fullyParallel: true,
   forbidOnly: !!process.env.CI,
   retries: process.env.CI ? 2 : 0,
   workers: process.env.CI ? 1 : undefined,
   reporter: 'list',
-  projects: [{ name: 'default' }],
+  projects: [
+    { name: 'chrome' },
+    { name: 'msedge', use: { mcpBrowser: 'msedge' } },
+    { name: 'chromium', use: { mcpBrowser: 'chromium' } },
+    { name: 'firefox', use: { mcpBrowser: 'firefox' } },
+    { name: 'webkit', use: { mcpBrowser: 'webkit' } },
+  ],
 });

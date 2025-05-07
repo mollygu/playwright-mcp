@@ -15,26 +15,15 @@
  * limitations under the License.
  */
 
-import type { LaunchOptions } from 'playwright';
 import type { Server } from '@modelcontextprotocol/sdk/server/index.js';
+import type { Config } from './config';
+import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
 
-type Options = {
-  /**
-   * Path to the user data directory.
-   */
-  userDataDir?: string;
-
-  /**
-   * Launch options for the browser.
-   */
-  launchOptions?: LaunchOptions;
-
-  /**
-   * Use screenshots instead of snapshots. Less accurate, reliable and overall
-   * slower, but contains visual representation of the page.
-   * @default false
-   */
-  vision?: boolean;
+export type Connection = {
+  server: Server;
+  connect(transport: Transport): Promise<void>;
+  close(): Promise<void>;
 };
 
-export function createServer(options?: Options): Server;
+export declare function createConnection(config?: Config): Promise<Connection>;
+export {};

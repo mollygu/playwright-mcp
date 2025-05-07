@@ -14,209 +14,370 @@
  * limitations under the License.
  */
 
-import { fork } from 'child_process';
-import path from 'path';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 
 import * as playwright from 'playwright';
-import yaml from 'yaml';
 
-export type ContextOptions = {
-  browserName?: 'chromium' | 'firefox' | 'webkit';
-  userDataDir: string;
-  launchOptions?: playwright.LaunchOptions;
-  cdpEndpoint?: string;
-  remoteEndpoint?: string;
+import { waitForCompletion } from './tools/utils.js';
+import { ManualPromise } from './manualPromise.js';
+import { Tab } from './tab.js';
+
+import type { ImageContent, TextContent } from '@modelcontextprotocol/sdk/types.js';
+import type { ModalState, Tool, ToolActionResult } from './tools/tool.js';
+import type { Config } from '../config.js';
+import { outputFile } from './config.js';
+
+type PendingAction = {
+  dialogShown: ManualPromise<void>;
 };
 
 export class Context {
-  private _options: ContextOptions;
+  readonly tools: Tool[];
+  readonly config: Config;
   private _browser: playwright.Browser | undefined;
-  private _page: playwright.Page | undefined;
-  private _console: playwright.ConsoleMessage[] = [];
-  private _createPagePromise: Promise<playwright.Page> | undefined;
-  private _fileChooser: playwright.FileChooser | undefined;
-  private _lastSnapshotFrames: (playwright.Page | playwright.FrameLocator)[] = [];
+  private _browserContext: playwright.BrowserContext | undefined;
+  private _createBrowserContextPromise: Promise<{ browser?: playwright.Browser, browserContext: playwright.BrowserContext }> | undefined;
+  private _tabs: Tab[] = [];
+  private _currentTab: Tab | undefined;
+  private _modalStates: (ModalState & { tab: Tab })[] = [];
+  private _pendingAction: PendingAction | undefined;
+  private _downloads: { download: playwright.Download, finished: boolean, outputFile: string }[] = [];
 
-  constructor(options: ContextOptions) {
-    this._options = options;
+  constructor(tools: Tool[], config: Config) {
+    this.tools = tools;
+    this.config = config;
   }
 
-  async createPage(): Promise<playwright.Page> {
-    if (this._createPagePromise)
-      return this._createPagePromise;
-    this._createPagePromise = (async () => {
-      const { browser, page } = await this._createPage();
-      page.on('console', event => this._console.push(event));
-      page.on('framenavigated', frame => {
-        if (!frame.parentFrame())
-          this._console.length = 0;
-      });
-      page.on('close', () => this._onPageClose());
-      page.on('filechooser', chooser => this._fileChooser = chooser);
-      page.setDefaultNavigationTimeout(60000);
-      page.setDefaultTimeout(5000);
-      this._page = page;
-      this._browser = browser;
-      return page;
-    })();
-    return this._createPagePromise;
+  modalStates(): ModalState[] {
+    return this._modalStates;
   }
 
-  private _onPageClose() {
-    const browser = this._browser;
-    const page = this._page;
-    void page?.context()?.close().then(() => browser?.close()).catch(() => {});
-
-    this._createPagePromise = undefined;
-    this._browser = undefined;
-    this._page = undefined;
-    this._fileChooser = undefined;
-    this._console.length = 0;
+  setModalState(modalState: ModalState, inTab: Tab) {
+    this._modalStates.push({ ...modalState, tab: inTab });
   }
 
-  async install(): Promise<string> {
-    const channel = this._options.launchOptions?.channel ?? this._options.browserName ?? 'chrome';
-    const cli = path.join(require.resolve('playwright/package.json'), '..', 'cli.js');
-    const child = fork(cli, ['install', channel], {
-      stdio: 'pipe',
-    });
-    const output: string[] = [];
-    child.stdout?.on('data', data => output.push(data.toString()));
-    child.stderr?.on('data', data => output.push(data.toString()));
-    return new Promise((resolve, reject) => {
-      child.on('close', code => {
-        if (code === 0)
-          resolve(channel);
+  clearModalState(modalState: ModalState) {
+    this._modalStates = this._modalStates.filter(state => state !== modalState);
+  }
+
+  modalStatesMarkdown(): string[] {
+    const result: string[] = ['### Modal state'];
+    if (this._modalStates.length === 0)
+      result.push('- There is no modal state present');
+    for (const state of this._modalStates) {
+      const tool = this.tools.find(tool => tool.clearsModalState === state.type);
+      result.push(`- [${state.description}]: can be handled by the "${tool?.schema.name}" tool`);
+    }
+    return result;
+  }
+
+  tabs(): Tab[] {
+    return this._tabs;
+  }
+
+  currentTabOrDie(): Tab {
+    if (!this._currentTab)
+      throw new Error('No current snapshot available. Capture a snapshot of navigate to a new location first.');
+    return this._currentTab;
+  }
+
+  async newTab(): Promise<Tab> {
+    const browserContext = await this._ensureBrowserContext();
+    const page = await browserContext.newPage();
+    this._currentTab = this._tabs.find(t => t.page === page)!;
+    return this._currentTab;
+  }
+
+  async selectTab(index: number) {
+    this._currentTab = this._tabs[index - 1];
+    await this._currentTab.page.bringToFront();
+  }
+
+  async ensureTab(): Promise<Tab> {
+    const context = await this._ensureBrowserContext();
+    if (!this._currentTab)
+      await context.newPage();
+    return this._currentTab!;
+  }
+
+  async listTabsMarkdown(): Promise<string> {
+    if (!this._tabs.length)
+      return '### No tabs open';
+    const lines: string[] = ['### Open tabs'];
+    for (let i = 0; i < this._tabs.length; i++) {
+      const tab = this._tabs[i];
+      const title = await tab.page.title();
+      const url = tab.page.url();
+      const current = tab === this._currentTab ? ' (current)' : '';
+      lines.push(`- ${i + 1}:${current} [${title}] (${url})`);
+    }
+    return lines.join('\n');
+  }
+
+  async closeTab(index: number | undefined) {
+    const tab = index === undefined ? this._currentTab : this._tabs[index - 1];
+    await tab?.page.close();
+    return await this.listTabsMarkdown();
+  }
+
+  async run(tool: Tool, params: Record<string, unknown> | undefined) {
+    // Tab management is done outside of the action() call.
+    const toolResult = await tool.handle(this, tool.schema.inputSchema.parse(params));
+    const { code, action, waitForNetwork, captureSnapshot, resultOverride } = toolResult;
+    const racingAction = action ? () => this._raceAgainstModalDialogs(action) : undefined;
+
+    if (resultOverride)
+      return resultOverride;
+
+    if (!this._currentTab) {
+      return {
+        content: [{
+          type: 'text',
+          text: 'No open pages available. Use the "browser_navigate" tool to navigate to a page first.',
+        }],
+      };
+    }
+
+    const tab = this.currentTabOrDie();
+    // TODO: race against modal dialogs to resolve clicks.
+    let actionResult: { content?: (ImageContent | TextContent)[] } | undefined;
+    try {
+      if (waitForNetwork)
+        actionResult = await waitForCompletion(this, tab.page, async () => racingAction?.()) ?? undefined;
+      else
+        actionResult = await racingAction?.() ?? undefined;
+    } finally {
+      if (captureSnapshot && !this._javaScriptBlocked())
+        await tab.captureSnapshot();
+    }
+
+    const result: string[] = [];
+    result.push(`- Ran Playwright code:
+\`\`\`js
+${code.join('\n')}
+\`\`\`
+`);
+
+    if (this.modalStates().length) {
+      result.push(...this.modalStatesMarkdown());
+      return {
+        content: [{
+          type: 'text',
+          text: result.join('\n'),
+        }],
+      };
+    }
+
+    if (this._downloads.length) {
+      result.push('', '### Downloads');
+      for (const entry of this._downloads) {
+        if (entry.finished)
+          result.push(`- Downloaded file ${entry.download.suggestedFilename()} to ${entry.outputFile}`);
         else
-          reject(new Error(`Failed to install browser: ${output.join('')}`));
-      });
-    });
+          result.push(`- Downloading file ${entry.download.suggestedFilename()} ...`);
+      }
+      result.push('');
+    }
+
+    if (this.tabs().length > 1)
+      result.push(await this.listTabsMarkdown(), '');
+
+    if (this.tabs().length > 1)
+      result.push('### Current tab');
+
+    result.push(
+        `- Page URL: ${tab.page.url()}`,
+        `- Page Title: ${await tab.page.title()}`
+    );
+
+    if (captureSnapshot && tab.hasSnapshot())
+      result.push(tab.snapshotOrDie().text());
+
+    const content = actionResult?.content ?? [];
+
+    return {
+      content: [
+        ...content,
+        {
+          type: 'text',
+          text: result.join('\n'),
+        }
+      ],
+    };
   }
 
-  existingPage(): playwright.Page {
-    if (!this._page)
-      throw new Error('Navigate to a location to create a page');
-    return this._page;
+  async waitForTimeout(time: number) {
+    if (this._currentTab && !this._javaScriptBlocked())
+      await this._currentTab.page.evaluate(() => new Promise(f => setTimeout(f, 1000)));
+    else
+      await new Promise(f => setTimeout(f, time));
   }
 
-  async console(): Promise<playwright.ConsoleMessage[]> {
-    return this._console;
+  private async _raceAgainstModalDialogs(action: () => Promise<ToolActionResult>): Promise<ToolActionResult> {
+    this._pendingAction = {
+      dialogShown: new ManualPromise(),
+    };
+
+    let result: ToolActionResult | undefined;
+    try {
+      await Promise.race([
+        action().then(r => result = r),
+        this._pendingAction.dialogShown,
+      ]);
+    } finally {
+      this._pendingAction = undefined;
+    }
+    return result;
+  }
+
+  private _javaScriptBlocked(): boolean {
+    return this._modalStates.some(state => state.type === 'dialog');
+  }
+
+  dialogShown(tab: Tab, dialog: playwright.Dialog) {
+    this.setModalState({
+      type: 'dialog',
+      description: `"${dialog.type()}" dialog with message "${dialog.message()}"`,
+      dialog,
+    }, tab);
+    this._pendingAction?.dialogShown.resolve();
+  }
+
+  async downloadStarted(tab: Tab, download: playwright.Download) {
+    const entry = {
+      download,
+      finished: false,
+      outputFile: await outputFile(this.config, download.suggestedFilename())
+    };
+    this._downloads.push(entry);
+    await download.saveAs(entry.outputFile);
+    entry.finished = true;
+  }
+
+  private _onPageCreated(page: playwright.Page) {
+    const tab = new Tab(this, page, tab => this._onPageClosed(tab));
+    this._tabs.push(tab);
+    if (!this._currentTab)
+      this._currentTab = tab;
+  }
+
+  private _onPageClosed(tab: Tab) {
+    this._modalStates = this._modalStates.filter(state => state.tab !== tab);
+    const index = this._tabs.indexOf(tab);
+    if (index === -1)
+      return;
+    this._tabs.splice(index, 1);
+
+    if (this._currentTab === tab)
+      this._currentTab = this._tabs[Math.min(index, this._tabs.length - 1)];
+    if (this._browserContext && !this._tabs.length)
+      void this.close();
   }
 
   async close() {
-    if (!this._page)
+    if (!this._browserContext)
       return;
-    await this._page.close();
+    const browserContext = this._browserContext;
+    const browser = this._browser;
+    this._createBrowserContextPromise = undefined;
+    this._browserContext = undefined;
+    this._browser = undefined;
+
+    await browserContext?.close().then(async () => {
+      await browser?.close();
+    }).catch(() => {});
   }
 
-  async submitFileChooser(paths: string[]) {
-    if (!this._fileChooser)
-      throw new Error('No file chooser visible');
-    await this._fileChooser.setFiles(paths);
-    this._fileChooser = undefined;
-  }
+  private async _setupRequestInterception(context: playwright.BrowserContext) {
+    if (this.config.network?.allowedOrigins?.length) {
+      await context.route('**', route => route.abort('blockedbyclient'));
 
-  hasFileChooser() {
-    return !!this._fileChooser;
-  }
-
-  clearFileChooser() {
-    this._fileChooser = undefined;
-  }
-
-  private async _createPage(): Promise<{ browser?: playwright.Browser, page: playwright.Page }> {
-    if (this._options.remoteEndpoint) {
-      const url = new URL(this._options.remoteEndpoint);
-      if (this._options.browserName)
-        url.searchParams.set('browser', this._options.browserName);
-      if (this._options.launchOptions)
-        url.searchParams.set('launch-options', JSON.stringify(this._options.launchOptions));
-      const browser = await playwright[this._options.browserName ?? 'chromium'].connect(String(url));
-      const page = await browser.newPage();
-      return { browser, page };
+      for (const origin of this.config.network.allowedOrigins)
+        await context.route(`*://${origin}/**`, route => route.continue());
     }
 
-    if (this._options.cdpEndpoint) {
-      const browser = await playwright.chromium.connectOverCDP(this._options.cdpEndpoint);
+    if (this.config.network?.blockedOrigins?.length) {
+      for (const origin of this.config.network.blockedOrigins)
+        await context.route(`*://${origin}/**`, route => route.abort('blockedbyclient'));
+    }
+  }
+
+  private async _ensureBrowserContext() {
+    if (!this._browserContext) {
+      const context = await this._createBrowserContext();
+      this._browser = context.browser;
+      this._browserContext = context.browserContext;
+      await this._setupRequestInterception(this._browserContext);
+      for (const page of this._browserContext.pages())
+        this._onPageCreated(page);
+      this._browserContext.on('page', page => this._onPageCreated(page));
+    }
+    return this._browserContext;
+  }
+
+  private async _createBrowserContext(): Promise<{ browser?: playwright.Browser, browserContext: playwright.BrowserContext }> {
+    if (!this._createBrowserContextPromise) {
+      this._createBrowserContextPromise = this._innerCreateBrowserContext();
+      void this._createBrowserContextPromise.catch(() => {
+        this._createBrowserContextPromise = undefined;
+      });
+    }
+    return this._createBrowserContextPromise;
+  }
+
+  private async _innerCreateBrowserContext(): Promise<{ browser?: playwright.Browser, browserContext: playwright.BrowserContext }> {
+    if (this.config.browser?.remoteEndpoint) {
+      const url = new URL(this.config.browser?.remoteEndpoint);
+      if (this.config.browser.browserName)
+        url.searchParams.set('browser', this.config.browser.browserName);
+      if (this.config.browser.launchOptions)
+        url.searchParams.set('launch-options', JSON.stringify(this.config.browser.launchOptions));
+      const browser = await playwright[this.config.browser?.browserName ?? 'chromium'].connect(String(url));
+      const browserContext = await browser.newContext();
+      return { browser, browserContext };
+    }
+
+    if (this.config.browser?.cdpEndpoint) {
+      const browser = await playwright.chromium.connectOverCDP(this.config.browser.cdpEndpoint);
       const browserContext = browser.contexts()[0];
-      let [page] = browserContext.pages();
-      if (!page)
-        page = await browserContext.newPage();
-      return { browser, page };
+      return { browser, browserContext };
     }
 
-    const context = await this._launchPersistentContext();
-    const [page] = context.pages();
-    return { page };
+    const browserContext = await launchPersistentContext(this.config.browser);
+    return { browserContext };
   }
+}
 
-  private async _launchPersistentContext(): Promise<playwright.BrowserContext> {
-    try {
-      const browserType = this._options.browserName ? playwright[this._options.browserName] : playwright.chromium;
-      return await browserType.launchPersistentContext(this._options.userDataDir, this._options.launchOptions);
-    } catch (error: any) {
-      if (error.message.includes('Executable doesn\'t exist'))
-        throw new Error(`Browser specified in your config is not installed. Either install it (likely) or change the config.`);
-      throw error;
-    }
+async function launchPersistentContext(browserConfig: Config['browser']): Promise<playwright.BrowserContext> {
+  try {
+    const browserName = browserConfig?.browserName ?? 'chromium';
+    const userDataDir = browserConfig?.userDataDir ?? await createUserDataDir({ ...browserConfig, browserName });
+    const browserType = playwright[browserName];
+    return await browserType.launchPersistentContext(userDataDir, { ...browserConfig?.launchOptions, ...browserConfig?.contextOptions });
+  } catch (error: any) {
+    if (error.message.includes('Executable doesn\'t exist'))
+      throw new Error(`Browser specified in your config is not installed. Either install it (likely) or change the config.`);
+    throw error;
   }
+}
 
-  async allFramesSnapshot() {
-    this._lastSnapshotFrames = [];
-    const yaml = await this._allFramesSnapshot(this.existingPage());
-    return yaml.toString().trim();
-  }
+async function createUserDataDir(browserConfig: Config['browser']) {
+  let cacheDirectory: string;
+  if (process.platform === 'linux')
+    cacheDirectory = process.env.XDG_CACHE_HOME || path.join(os.homedir(), '.cache');
+  else if (process.platform === 'darwin')
+    cacheDirectory = path.join(os.homedir(), 'Library', 'Caches');
+  else if (process.platform === 'win32')
+    cacheDirectory = process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local');
+  else
+    throw new Error('Unsupported platform: ' + process.platform);
+  const result = path.join(cacheDirectory, 'ms-playwright', `mcp-${browserConfig?.launchOptions.channel ?? browserConfig?.browserName}-profile`);
+  await fs.promises.mkdir(result, { recursive: true });
+  return result;
+}
 
-  private async _allFramesSnapshot(frame: playwright.Page | playwright.FrameLocator): Promise<yaml.Document> {
-    const frameIndex = this._lastSnapshotFrames.push(frame) - 1;
-    const snapshotString = await frame.locator('body').ariaSnapshot({ ref: true });
-    const snapshot = yaml.parseDocument(snapshotString);
-
-    const visit = async (node: any): Promise<unknown> => {
-      if (yaml.isPair(node)) {
-        await Promise.all([
-          visit(node.key).then(k => node.key = k),
-          visit(node.value).then(v => node.value = v)
-        ]);
-      } else if (yaml.isSeq(node) || yaml.isMap(node)) {
-        node.items = await Promise.all(node.items.map(visit));
-      } else if (yaml.isScalar(node)) {
-        if (typeof node.value === 'string') {
-          const value = node.value;
-          if (frameIndex > 0)
-            node.value = value.replace('[ref=', `[ref=f${frameIndex}`);
-          if (value.startsWith('iframe ')) {
-            const ref = value.match(/\[ref=(.*)\]/)?.[1];
-            if (ref) {
-              try {
-                const childSnapshot = await this._allFramesSnapshot(frame.frameLocator(`aria-ref=${ref}`));
-                return snapshot.createPair(node.value, childSnapshot);
-              } catch (error) {
-                return snapshot.createPair(node.value, '<could not take iframe snapshot>');
-              }
-            }
-          }
-        }
-      }
-
-      return node;
-    };
-    await visit(snapshot.contents);
-    return snapshot;
-  }
-
-  refLocator(ref: string): playwright.Locator {
-    let frame = this._lastSnapshotFrames[0];
-    const match = ref.match(/^f(\d+)(.*)/);
-    if (match) {
-      const frameIndex = parseInt(match[1], 10);
-      frame = this._lastSnapshotFrames[frameIndex];
-      ref = match[2];
-    }
-
-    if (!frame)
-      throw new Error(`Frame does not exist. Provide ref from the most current snapshot.`);
-
-    return frame.locator(`aria-ref=${ref}`);
-  }
+export async function generateLocator(locator: playwright.Locator): Promise<string> {
+  return (locator as any)._generateLocatorString();
 }

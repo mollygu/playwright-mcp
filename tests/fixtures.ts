@@ -14,46 +14,72 @@
  * limitations under the License.
  */
 
+import fs from 'fs';
+import url from 'url';
 import path from 'path';
 import { chromium } from 'playwright';
 
 import { test as baseTest, expect as baseExpect } from '@playwright/test';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { ChildProcessWithoutNullStreams, spawn } from 'child_process';
+import { TestServer } from './testserver/index.ts';
 
-type Fixtures = {
-  client: Client;
-  visionClient: Client;
-  startClient: (options?: { args?: string[], vision?: boolean }) => Promise<Client>;
-  wsEndpoint: string;
-  cdpEndpoint: string;
+import type { Config } from '../config';
+
+export type TestOptions = {
+  mcpBrowser: string | undefined;
 };
 
-export const test = baseTest.extend<Fixtures>({
+type TestFixtures = {
+  client: Client;
+  visionClient: Client;
+  startClient: (options?: { clientName?: string, args?: string[], config?: Config }) => Promise<Client>;
+  wsEndpoint: string;
+  cdpEndpoint: (port?: number) => Promise<string>;
+  server: TestServer;
+  httpsServer: TestServer;
+  mcpHeadless: boolean;
+};
+
+type WorkerFixtures = {
+  _workerServers: { server: TestServer, httpsServer: TestServer };
+};
+
+export const test = baseTest.extend<TestFixtures & TestOptions, WorkerFixtures>({
 
   client: async ({ startClient }, use) => {
     await use(await startClient());
   },
 
   visionClient: async ({ startClient }, use) => {
-    await use(await startClient({ vision: true }));
+    await use(await startClient({ args: ['--vision'] }));
   },
 
-  startClient: async ({ }, use, testInfo) => {
+  startClient: async ({ mcpHeadless, mcpBrowser }, use, testInfo) => {
     const userDataDir = testInfo.outputPath('user-data-dir');
-    let client: StdioClientTransport | undefined;
+    let client: Client | undefined;
 
-    use(async options => {
-      const args = ['--headless', '--user-data-dir', userDataDir];
-      if (options?.vision)
-        args.push('--vision');
+    await use(async options => {
+      const args = ['--user-data-dir', userDataDir];
+      if (mcpHeadless)
+        args.push('--headless');
+      if (mcpBrowser)
+        args.push(`--browser=${mcpBrowser}`);
       if (options?.args)
         args.push(...options.args);
+      if (options?.config) {
+        const configFile = testInfo.outputPath('config.json');
+        await fs.promises.writeFile(configFile, JSON.stringify(options.config, null, 2));
+        args.push(`--config=${configFile}`);
+      }
+      // NOTE: Can be removed when we drop Node.js 18 support and changed to import.meta.filename.
+      const __filename = url.fileURLToPath(import.meta.url);
       const transport = new StdioClientTransport({
         command: 'node',
-        args: [path.join(__dirname, '../cli.js'), ...args],
+        args: [path.join(path.dirname(__filename), '../cli.js'), ...args],
       });
-      const client = new Client({ name: 'test', version: '1.0.0' });
+      client = new Client({ name: options?.clientName ?? 'test', version: '1.0.0' });
       await client.connect(transport);
       await client.ping();
       return client;
@@ -69,13 +95,64 @@ export const test = baseTest.extend<Fixtures>({
   },
 
   cdpEndpoint: async ({ }, use, testInfo) => {
-    const port = 3200 + (+process.env.TEST_PARALLEL_INDEX!);
-    const browser = await chromium.launchPersistentContext(testInfo.outputPath('user-data-dir'), {
-      channel: 'chrome',
-      args: [`--remote-debugging-port=${port}`],
+    let browserProcess: ChildProcessWithoutNullStreams | undefined;
+
+    await use(async port => {
+      if (!port)
+        port = 3200 + test.info().parallelIndex;
+      if (browserProcess)
+        return `http://localhost:${port}`;
+      browserProcess = spawn(chromium.executablePath(), [
+        `--user-data-dir=${testInfo.outputPath('user-data-dir')}`,
+        `--remote-debugging-port=${port}`,
+        `--no-first-run`,
+        `--no-sandbox`,
+        `--headless`,
+        '--use-mock-keychain',
+        `data:text/html,hello world`,
+      ], {
+        stdio: 'pipe',
+      });
+      await new Promise<void>(resolve => {
+        browserProcess!.stderr.on('data', data => {
+          if (data.toString().includes('DevTools listening on '))
+            resolve();
+        });
+      });
+      return `http://localhost:${port}`;
     });
-    await use(`http://localhost:${port}`);
-    await browser.close();
+    browserProcess?.kill();
+  },
+
+  mcpHeadless: async ({ headless }, use) => {
+    await use(headless);
+  },
+
+  mcpBrowser: ['chrome', { option: true }],
+
+  _workerServers: [async ({}, use, workerInfo) => {
+    const port = 8907 + workerInfo.workerIndex * 4;
+    const server = await TestServer.create(port);
+
+    const httpsPort = port + 1;
+    const httpsServer = await TestServer.createHTTPS(httpsPort);
+
+    await use({ server, httpsServer });
+
+    await Promise.all([
+      server.stop(),
+      httpsServer.stop(),
+    ]);
+  }, { scope: 'worker' }],
+
+  server: async ({ _workerServers }, use) => {
+    _workerServers.server.reset();
+    await use(_workerServers.server);
+  },
+
+  httpsServer: async ({ _workerServers }, use) => {
+    _workerServers.httpsServer.reset();
+    await use(_workerServers.httpsServer);
   },
 });
 
@@ -86,10 +163,17 @@ export const expect = baseExpect.extend({
     const isNot = this.isNot;
     try {
       const text = (response.content as any)[0].text;
-      if (isNot)
-        baseExpect(text).not.toMatch(content);
-      else
-        baseExpect(text).toMatch(content);
+      if (typeof content === 'string') {
+        if (isNot)
+          baseExpect(text.trim()).not.toBe(content.trim());
+        else
+          baseExpect(text.trim()).toBe(content.trim());
+      } else {
+        if (isNot)
+          baseExpect(text).not.toMatch(content);
+        else
+          baseExpect(text).toMatch(content);
+      }
     } catch (e) {
       return {
         pass: isNot,
