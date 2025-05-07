@@ -19,6 +19,7 @@ import console from './tools/console.js';
 import cookies from './tools/cookies.js';
 import dialogs from './tools/dialogs.js';
 import files from './tools/files.js';
+import highlight from './tools/highlight.js';
 import htmlSnippet from './tools/htmlSnippet.js';
 import install from './tools/install.js';
 import inspector from './tools/inspector.js';
@@ -39,6 +40,7 @@ export const snapshotTools: Tool<any>[] = [
   ...cookies(true),
   ...dialogs(true),
   ...files(true),
+  ...highlight(true),
   ...htmlSnippet(true),
   ...install,
   ...inspector(true),
@@ -57,6 +59,7 @@ export const screenshotTools: Tool<any>[] = [
   ...cookies(false),
   ...dialogs(false),
   ...files(false),
+  ...highlight(false),
   ...htmlSnippet(false),
   ...install,
   ...inspector(false),
