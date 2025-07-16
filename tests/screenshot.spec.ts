@@ -18,17 +18,17 @@ import fs from 'fs';
 
 import { test, expect } from './fixtures.js';
 
-test('browser_take_screenshot (viewport)', async ({ client }) => {
+test('browser_take_screenshot (viewport)', async ({ startClient, server }, testInfo) => {
+  const { client } = await startClient({
+    config: { outputDir: testInfo.outputPath('output') },
+  });
   expect(await client.callTool({
     name: 'browser_navigate',
-    arguments: {
-      url: 'data:text/html,<html><title>Title</title><body>Hello, world!</body></html>',
-    },
-  })).toContainTextContent(`Navigate to data:text/html`);
+    arguments: { url: server.HELLO_WORLD },
+  })).toContainTextContent(`Navigate to http://localhost`);
 
   expect(await client.callTool({
     name: 'browser_take_screenshot',
-    arguments: {},
   })).toEqual({
     content: [
       {
@@ -44,19 +44,20 @@ test('browser_take_screenshot (viewport)', async ({ client }) => {
   });
 });
 
-test('browser_take_screenshot (element)', async ({ client }) => {
+test('browser_take_screenshot (element)', async ({ startClient, server }, testInfo) => {
+  const { client } = await startClient({
+    config: { outputDir: testInfo.outputPath('output') },
+  });
   expect(await client.callTool({
     name: 'browser_navigate',
-    arguments: {
-      url: 'data:text/html,<html><title>Title</title><button>Hello, world!</button></html>',
-    },
-  })).toContainTextContent(`[ref=s1e3]`);
+    arguments: { url: server.HELLO_WORLD },
+  })).toContainTextContent(`[ref=e1]`);
 
   expect(await client.callTool({
     name: 'browser_take_screenshot',
     arguments: {
       element: 'hello button',
-      ref: 's1e3',
+      ref: 'e1',
     },
   })).toEqual({
     content: [
@@ -66,78 +67,131 @@ test('browser_take_screenshot (element)', async ({ client }) => {
         type: 'image',
       },
       {
-        text: expect.stringContaining(`page.getByRole('button', { name: 'Hello, world!' }).screenshot`),
+        text: expect.stringContaining(`page.getByText('Hello, world!').screenshot`),
         type: 'text',
       },
     ],
   });
 });
 
-test('--output-dir should work', async ({ startClient }, testInfo) => {
+test('--output-dir should work', async ({ startClient, server }, testInfo) => {
   const outputDir = testInfo.outputPath('output');
-  const client = await startClient({
-    args: ['--output-dir', outputDir],
-  });
-  expect(await client.callTool({
-    name: 'browser_navigate',
-    arguments: {
-      url: 'data:text/html,<html><title>Title</title><body>Hello, world!</body></html>',
-    },
-  })).toContainTextContent(`Navigate to data:text/html`);
-
-  await client.callTool({
-    name: 'browser_take_screenshot',
-    arguments: {},
-  });
-
-  expect(fs.existsSync(outputDir)).toBeTruthy();
-  expect([...fs.readdirSync(outputDir)]).toHaveLength(1);
-});
-
-
-test('browser_take_screenshot (outputDir)', async ({ startClient }, testInfo) => {
-  const outputDir = testInfo.outputPath('output');
-  const client = await startClient({
+  const { client } = await startClient({
     config: { outputDir },
   });
   expect(await client.callTool({
     name: 'browser_navigate',
-    arguments: {
-      url: 'data:text/html,<html><title>Title</title><body>Hello, world!</body></html>',
-    },
-  })).toContainTextContent(`Navigate to data:text/html`);
+    arguments: { url: server.HELLO_WORLD },
+  })).toContainTextContent(`Navigate to http://localhost`);
 
   await client.callTool({
     name: 'browser_take_screenshot',
-    arguments: {},
   });
 
   expect(fs.existsSync(outputDir)).toBeTruthy();
-  expect([...fs.readdirSync(outputDir)]).toHaveLength(1);
+  const files = [...fs.readdirSync(outputDir)].filter(f => f.endsWith('.jpeg'));
+  expect(files).toHaveLength(1);
+  expect(files[0]).toMatch(/^page-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z\.jpeg$/);
 });
 
-test('browser_take_screenshot (noImageResponses)', async ({ startClient }) => {
-  const client = await startClient({
+for (const raw of [undefined, true]) {
+  test(`browser_take_screenshot (raw: ${raw})`, async ({ startClient, server }, testInfo) => {
+    const outputDir = testInfo.outputPath('output');
+    const ext = raw ? 'png' : 'jpeg';
+    const { client } = await startClient({
+      config: { outputDir },
+    });
+    expect(await client.callTool({
+      name: 'browser_navigate',
+      arguments: { url: server.PREFIX },
+    })).toContainTextContent(`Navigate to http://localhost`);
+
+    expect(await client.callTool({
+      name: 'browser_take_screenshot',
+      arguments: { raw },
+    })).toEqual({
+      content: [
+        {
+          data: expect.any(String),
+          mimeType: `image/${ext}`,
+          type: 'image',
+        },
+        {
+          text: expect.stringMatching(
+              new RegExp(`page-\\d{4}-\\d{2}-\\d{2}T\\d{2}-\\d{2}-\\d{2}\\-\\d{3}Z\\.${ext}`)
+          ),
+          type: 'text',
+        },
+      ],
+    });
+
+    const files = [...fs.readdirSync(outputDir)].filter(f => f.endsWith(`.${ext}`));
+
+    expect(fs.existsSync(outputDir)).toBeTruthy();
+    expect(files).toHaveLength(1);
+    expect(files[0]).toMatch(
+        new RegExp(`^page-\\d{4}-\\d{2}-\\d{2}T\\d{2}-\\d{2}-\\d{2}-\\d{3}Z\\.${ext}$`)
+    );
+  });
+
+}
+
+test('browser_take_screenshot (filename: "output.jpeg")', async ({ startClient, server }, testInfo) => {
+  const outputDir = testInfo.outputPath('output');
+  const { client } = await startClient({
+    config: { outputDir },
+  });
+  expect(await client.callTool({
+    name: 'browser_navigate',
+    arguments: { url: server.HELLO_WORLD },
+  })).toContainTextContent(`Navigate to http://localhost`);
+
+  expect(await client.callTool({
+    name: 'browser_take_screenshot',
+    arguments: {
+      filename: 'output.jpeg',
+    },
+  })).toEqual({
+    content: [
+      {
+        data: expect.any(String),
+        mimeType: 'image/jpeg',
+        type: 'image',
+      },
+      {
+        text: expect.stringContaining(`output.jpeg`),
+        type: 'text',
+      },
+    ],
+  });
+
+  const files = [...fs.readdirSync(outputDir)].filter(f => f.endsWith('.jpeg'));
+
+  expect(fs.existsSync(outputDir)).toBeTruthy();
+  expect(files).toHaveLength(1);
+  expect(files[0]).toMatch(/^output\.jpeg$/);
+});
+
+test('browser_take_screenshot (imageResponses=omit)', async ({ startClient, server }, testInfo) => {
+  const outputDir = testInfo.outputPath('output');
+  const { client } = await startClient({
     config: {
-      noImageResponses: true,
+      outputDir,
+      imageResponses: 'omit',
     },
   });
 
   expect(await client.callTool({
     name: 'browser_navigate',
-    arguments: {
-      url: 'data:text/html,<html><title>Title</title><body>Hello, world!</body></html>',
-    },
-  })).toContainTextContent(`Navigate to data:text/html`);
+    arguments: { url: server.HELLO_WORLD },
+  })).toContainTextContent(`Navigate to http://localhost`);
 
   await client.callTool({
     name: 'browser_take_screenshot',
-    arguments: {},
   });
 
   expect(await client.callTool({
     name: 'browser_take_screenshot',
-    arguments: {},
   })).toEqual({
     content: [
       {
@@ -148,24 +202,25 @@ test('browser_take_screenshot (noImageResponses)', async ({ startClient }) => {
   });
 });
 
-test('browser_take_screenshot (cursor)', async ({ startClient }) => {
-  const client = await startClient({ clientName: 'cursor:vscode' });
+test('browser_take_screenshot (cursor)', async ({ startClient, server }, testInfo) => {
+  const outputDir = testInfo.outputPath('output');
+
+  const { client } = await startClient({
+    clientName: 'cursor:vscode',
+    config: { outputDir },
+  });
 
   expect(await client.callTool({
     name: 'browser_navigate',
-    arguments: {
-      url: 'data:text/html,<html><title>Title</title><body>Hello, world!</body></html>',
-    },
-  })).toContainTextContent(`Navigate to data:text/html`);
+    arguments: { url: server.HELLO_WORLD },
+  })).toContainTextContent(`Navigate to http://localhost`);
 
   await client.callTool({
     name: 'browser_take_screenshot',
-    arguments: {},
   });
 
   expect(await client.callTool({
     name: 'browser_take_screenshot',
-    arguments: {},
   })).toEqual({
     content: [
       {

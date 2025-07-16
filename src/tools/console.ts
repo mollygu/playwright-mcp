@@ -27,8 +27,8 @@ const console = defineTool({
     type: 'readOnly',
   },
   handle: async context => {
-    const messages = context.currentTabOrDie().console();
-    const log = messages.map(message => `[${message.type().toUpperCase()}] ${message.text()}`).join('\n');
+    const messages = context.currentTabOrDie().consoleMessages();
+    const log = messages.map(message => message.toString()).join('\n');
     return {
       code: [`// <internal code to get console messages>`],
       action: async () => {

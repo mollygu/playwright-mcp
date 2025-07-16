@@ -43,7 +43,7 @@ test('test snapshot tool list', async ({ client }) => {
     'browser_tab_new',
     'browser_tab_select',
     'browser_take_screenshot',
-    'browser_wait',
+    'browser_wait_for',
   ]));
 });
 
@@ -72,12 +72,12 @@ test('test vision tool list', async ({ visionClient }) => {
     'browser_tab_list',
     'browser_tab_new',
     'browser_tab_select',
-    'browser_wait',
+    'browser_wait_for',
   ]));
 });
 
 test('test capabilities', async ({ startClient }) => {
-  const client = await startClient({
+  const { client } = await startClient({
     args: ['--caps="core"'],
   });
   const { tools } = await client.listTools();

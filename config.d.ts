@@ -24,9 +24,19 @@ export type Config = {
    */
   browser?: {
     /**
+     * Use browser agent (experimental).
+     */
+    browserAgent?: string;
+
+    /**
      * The type of browser to use.
      */
     browserName?: 'chromium' | 'firefox' | 'webkit';
+
+    /**
+     * Keep the browser profile in memory, do not save it to disk.
+     */
+    isolated?: boolean;
 
     /**
      * Path to a user data directory for browser profile persistence.
@@ -40,7 +50,7 @@ export type Config = {
      *
      * This is useful for settings options like `channel`, `headless`, `executablePath`, etc.
      */
-    launchOptions?: playwright.BrowserLaunchOptions;
+    launchOptions?: playwright.LaunchOptions;
 
     /**
      * Context options for the browser context.
@@ -90,6 +100,11 @@ export type Config = {
   vision?: boolean;
 
   /**
+   * Whether to save the Playwright trace of the session into the output directory.
+   */
+  saveTrace?: boolean;
+
+  /**
    * The directory to save output files.
    */
   outputDir?: string;
@@ -107,7 +122,7 @@ export type Config = {
   };
 
   /**
-   * Do not send image responses to the client.
+   * Whether to send image responses to the client. Can be "allow", "omit", or "auto". Defaults to "auto", which sends images if the client can display them.
    */
-  noImageResponses?: boolean;
+  imageResponses?: 'allow' | 'omit' | 'auto';
 };

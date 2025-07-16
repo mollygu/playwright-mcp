@@ -15,7 +15,6 @@
  */
 
 import fs from 'fs';
-import net from 'net';
 import os from 'os';
 import path from 'path';
 import { devices } from 'playwright';
@@ -25,29 +24,41 @@ import type { BrowserContextOptions, LaunchOptions } from 'playwright';
 import { sanitizeForFilePath } from './tools/utils.js';
 
 export type CLIOptions = {
-  browser?: string;
-  caps?: string;
-  cdpEndpoint?: string;
-  executablePath?: string;
-  headless?: boolean;
-  device?: string;
-  userDataDir?: string;
-  port?: number;
-  host?: string;
-  vision?: boolean;
-  config?: string;
   allowedOrigins?: string[];
   blockedOrigins?: string[];
+  blockServiceWorkers?: boolean;
+  browser?: string;
+  browserAgent?: string;
+  caps?: string;
+  cdpEndpoint?: string;
+  config?: string;
+  device?: string;
+  executablePath?: string;
+  headless?: boolean;
+  host?: string;
+  ignoreHttpsErrors?: boolean;
+  isolated?: boolean;
+  imageResponses?: 'allow' | 'omit' | 'auto';
+  sandbox: boolean;
   outputDir?: string;
-  noImageResponses?: boolean;
+  port?: number;
+  proxyBypass?: string;
+  proxyServer?: string;
+  saveTrace?: boolean;
+  storageState?: string;
+  userAgent?: string;
+  userDataDir?: string;
+  viewportSize?: string;
+  vision?: boolean;
 };
 
-const defaultConfig: Config = {
+const defaultConfig: FullConfig = {
   browser: {
     browserName: 'chromium',
     launchOptions: {
       channel: 'chrome',
       headless: os.platform() === 'linux' && !process.env.DISPLAY,
+      chromiumSandbox: true,
     },
     contextOptions: {
       viewport: null,
@@ -57,16 +68,39 @@ const defaultConfig: Config = {
     allowedOrigins: undefined,
     blockedOrigins: undefined,
   },
+  server: {},
+  outputDir: path.join(os.tmpdir(), 'playwright-mcp-output', sanitizeForFilePath(new Date().toISOString())),
 };
 
-export async function resolveConfig(cliOptions: CLIOptions): Promise<Config> {
-  const config = await loadConfig(cliOptions.config);
+type BrowserUserConfig = NonNullable<Config['browser']>;
+
+export type FullConfig = Config & {
+  browser: Omit<BrowserUserConfig, 'browserName'> & {
+    browserName: 'chromium' | 'firefox' | 'webkit';
+    launchOptions: NonNullable<BrowserUserConfig['launchOptions']>;
+    contextOptions: NonNullable<BrowserUserConfig['contextOptions']>;
+  },
+  network: NonNullable<Config['network']>,
+  outputDir: string;
+  server: NonNullable<Config['server']>,
+};
+
+export async function resolveConfig(config: Config): Promise<FullConfig> {
+  return mergeConfig(defaultConfig, config);
+}
+
+export async function resolveCLIConfig(cliOptions: CLIOptions): Promise<FullConfig> {
+  const configInFile = await loadConfig(cliOptions.config);
   const cliOverrides = await configFromCLIOptions(cliOptions);
-  return mergeConfig(defaultConfig, mergeConfig(config, cliOverrides));
+  const result = mergeConfig(mergeConfig(defaultConfig, configInFile), cliOverrides);
+  // Derive artifact output directory from config.outputDir
+  if (result.saveTrace)
+    result.browser.launchOptions.tracesDir = path.join(result.outputDir, 'traces');
+  return result;
 }
 
 export async function configFromCLIOptions(cliOptions: CLIOptions): Promise<Config> {
-  let browserName: 'chromium' | 'firefox' | 'webkit';
+  let browserName: 'chromium' | 'firefox' | 'webkit' | undefined;
   let channel: string | undefined;
   switch (cliOptions.browser) {
     case 'chrome':
@@ -87,25 +121,60 @@ export async function configFromCLIOptions(cliOptions: CLIOptions): Promise<Conf
     case 'webkit':
       browserName = 'webkit';
       break;
-    default:
-      browserName = 'chromium';
-      channel = 'chrome';
   }
 
+  // Launch options
   const launchOptions: LaunchOptions = {
     channel,
     executablePath: cliOptions.executablePath,
     headless: cliOptions.headless,
   };
 
-  if (browserName === 'chromium')
-    (launchOptions as any).webSocketPort = await findFreePort();
+  // --no-sandbox was passed, disable the sandbox
+  if (!cliOptions.sandbox)
+    launchOptions.chromiumSandbox = false;
 
-  const contextOptions: BrowserContextOptions | undefined = cliOptions.device ? devices[cliOptions.device] : undefined;
+  if (cliOptions.proxyServer) {
+    launchOptions.proxy = {
+      server: cliOptions.proxyServer
+    };
+    if (cliOptions.proxyBypass)
+      launchOptions.proxy.bypass = cliOptions.proxyBypass;
+  }
 
-  return {
+  if (cliOptions.device && cliOptions.cdpEndpoint)
+    throw new Error('Device emulation is not supported with cdpEndpoint.');
+
+  // Context options
+  const contextOptions: BrowserContextOptions = cliOptions.device ? devices[cliOptions.device] : {};
+  if (cliOptions.storageState)
+    contextOptions.storageState = cliOptions.storageState;
+
+  if (cliOptions.userAgent)
+    contextOptions.userAgent = cliOptions.userAgent;
+
+  if (cliOptions.viewportSize) {
+    try {
+      const [width, height] = cliOptions.viewportSize.split(',').map(n => +n);
+      if (isNaN(width) || isNaN(height))
+        throw new Error('bad values');
+      contextOptions.viewport = { width, height };
+    } catch (e) {
+      throw new Error('Invalid viewport size format: use "width,height", for example --viewport-size="800,600"');
+    }
+  }
+
+  if (cliOptions.ignoreHttpsErrors)
+    contextOptions.ignoreHTTPSErrors = true;
+
+  if (cliOptions.blockServiceWorkers)
+    contextOptions.serviceWorkers = 'block';
+
+  const result: Config = {
     browser: {
+      browserAgent: cliOptions.browserAgent ?? process.env.PW_BROWSER_AGENT,
       browserName,
+      isolated: cliOptions.isolated,
       userDataDir: cliOptions.userDataDir,
       launchOptions,
       contextOptions,
@@ -121,19 +190,12 @@ export async function configFromCLIOptions(cliOptions: CLIOptions): Promise<Conf
       allowedOrigins: cliOptions.allowedOrigins,
       blockedOrigins: cliOptions.blockedOrigins,
     },
+    saveTrace: cliOptions.saveTrace,
     outputDir: cliOptions.outputDir,
+    imageResponses: cliOptions.imageResponses,
   };
-}
 
-async function findFreePort() {
-  return new Promise((resolve, reject) => {
-    const server = net.createServer();
-    server.listen(0, () => {
-      const { port } = server.address() as net.AddressInfo;
-      server.close(() => resolve(port));
-    });
-    server.on('error', reject);
-  });
+  return result;
 }
 
 async function loadConfig(configFile: string | undefined): Promise<Config> {
@@ -147,11 +209,10 @@ async function loadConfig(configFile: string | undefined): Promise<Config> {
   }
 }
 
-export async function outputFile(config: Config, name: string): Promise<string> {
-  const result = config.outputDir ?? os.tmpdir();
-  await fs.promises.mkdir(result, { recursive: true });
+export async function outputFile(config: FullConfig, name: string): Promise<string> {
+  await fs.promises.mkdir(config.outputDir, { recursive: true });
   const fileName = sanitizeForFilePath(name);
-  return path.join(result, fileName);
+  return path.join(config.outputDir, fileName);
 }
 
 function pickDefined<T extends object>(obj: T | undefined): Partial<T> {
@@ -160,10 +221,12 @@ function pickDefined<T extends object>(obj: T | undefined): Partial<T> {
   ) as Partial<T>;
 }
 
-function mergeConfig(base: Config, overrides: Config): Config {
-  const browser: Config['browser'] = {
+function mergeConfig(base: FullConfig, overrides: Config): FullConfig {
+  const browser: FullConfig['browser'] = {
     ...pickDefined(base.browser),
     ...pickDefined(overrides.browser),
+    browserName: overrides.browser?.browserName ?? base.browser?.browserName ?? 'chromium',
+    isolated: overrides.browser?.isolated ?? base.browser?.isolated ?? false,
     launchOptions: {
       ...pickDefined(base.browser?.launchOptions),
       ...pickDefined(overrides.browser?.launchOptions),
@@ -175,7 +238,7 @@ function mergeConfig(base: Config, overrides: Config): Config {
     },
   };
 
-  if (browser.browserName !== 'chromium')
+  if (browser.browserName !== 'chromium' && browser.launchOptions)
     delete browser.launchOptions.channel;
 
   return {
@@ -186,5 +249,9 @@ function mergeConfig(base: Config, overrides: Config): Config {
       ...pickDefined(base.network),
       ...pickDefined(overrides.network),
     },
-  };
+    server: {
+      ...pickDefined(base.server),
+      ...pickDefined(overrides.server),
+    },
+  } as FullConfig;
 }

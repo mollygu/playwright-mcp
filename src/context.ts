@@ -14,40 +14,50 @@
  * limitations under the License.
  */
 
-import fs from 'node:fs';
-import os from 'node:os';
-import path from 'node:path';
-
+import debug from 'debug';
 import * as playwright from 'playwright';
 
-import { waitForCompletion } from './tools/utils.js';
+import { callOnPageNoTrace, waitForCompletion } from './tools/utils.js';
 import { ManualPromise } from './manualPromise.js';
 import { Tab } from './tab.js';
+import { outputFile } from './config.js';
 
 import type { ImageContent, TextContent } from '@modelcontextprotocol/sdk/types.js';
 import type { ModalState, Tool, ToolActionResult } from './tools/tool.js';
-import type { Config } from '../config.js';
-import { outputFile } from './config.js';
+import type { FullConfig } from './config.js';
+import type { BrowserContextFactory } from './browserContextFactory.js';
 
 type PendingAction = {
   dialogShown: ManualPromise<void>;
 };
 
+const testDebug = debug('pw:mcp:test');
+
 export class Context {
   readonly tools: Tool[];
-  readonly config: Config;
-  private _browser: playwright.Browser | undefined;
-  private _browserContext: playwright.BrowserContext | undefined;
-  private _createBrowserContextPromise: Promise<{ browser?: playwright.Browser, browserContext: playwright.BrowserContext }> | undefined;
+  readonly config: FullConfig;
+  private _browserContextPromise: Promise<{ browserContext: playwright.BrowserContext, close: () => Promise<void> }> | undefined;
+  private _browserContextFactory: BrowserContextFactory;
   private _tabs: Tab[] = [];
   private _currentTab: Tab | undefined;
   private _modalStates: (ModalState & { tab: Tab })[] = [];
   private _pendingAction: PendingAction | undefined;
   private _downloads: { download: playwright.Download, finished: boolean, outputFile: string }[] = [];
+  clientVersion: { name: string; version: string; } | undefined;
 
-  constructor(tools: Tool[], config: Config) {
+  constructor(tools: Tool[], config: FullConfig, browserContextFactory: BrowserContextFactory) {
     this.tools = tools;
     this.config = config;
+    this._browserContextFactory = browserContextFactory;
+    testDebug('create context');
+  }
+
+  clientSupportsImages(): boolean {
+    if (this.config.imageResponses === 'allow')
+      return true;
+    if (this.config.imageResponses === 'omit')
+      return false;
+    return !this.clientVersion?.name.includes('cursor');
   }
 
   modalStates(): ModalState[] {
@@ -79,12 +89,12 @@ export class Context {
 
   currentTabOrDie(): Tab {
     if (!this._currentTab)
-      throw new Error('No current snapshot available. Capture a snapshot of navigate to a new location first.');
+      throw new Error('No current snapshot available. Capture a snapshot or navigate to a new location first.');
     return this._currentTab;
   }
 
   async newTab(): Promise<Tab> {
-    const browserContext = await this._ensureBrowserContext();
+    const { browserContext } = await this._ensureBrowserContext();
     const page = await browserContext.newPage();
     this._currentTab = this._tabs.find(t => t.page === page)!;
     return this._currentTab;
@@ -96,9 +106,9 @@ export class Context {
   }
 
   async ensureTab(): Promise<Tab> {
-    const context = await this._ensureBrowserContext();
+    const { browserContext } = await this._ensureBrowserContext();
     if (!this._currentTab)
-      await context.newPage();
+      await browserContext.newPage();
     return this._currentTab!;
   }
 
@@ -108,7 +118,7 @@ export class Context {
     const lines: string[] = ['### Open tabs'];
     for (let i = 0; i < this._tabs.length; i++) {
       const tab = this._tabs[i];
-      const title = await tab.page.title();
+      const title = await tab.title();
       const url = tab.page.url();
       const current = tab === this._currentTab ? ' (current)' : '';
       lines.push(`- ${i + 1}:${current} [${title}] (${url})`);
@@ -124,7 +134,7 @@ export class Context {
 
   async run(tool: Tool, params: Record<string, unknown> | undefined) {
     // Tab management is done outside of the action() call.
-    const toolResult = await tool.handle(this, tool.schema.inputSchema.parse(params));
+    const toolResult = await tool.handle(this, tool.schema.inputSchema.parse(params || {}));
     const { code, action, waitForNetwork, captureSnapshot, resultOverride } = toolResult;
     const racingAction = action ? () => this._raceAgainstModalDialogs(action) : undefined;
 
@@ -145,7 +155,7 @@ export class Context {
     let actionResult: { content?: (ImageContent | TextContent)[] } | undefined;
     try {
       if (waitForNetwork)
-        actionResult = await waitForCompletion(this, tab.page, async () => racingAction?.()) ?? undefined;
+        actionResult = await waitForCompletion(this, tab, async () => racingAction?.()) ?? undefined;
       else
         actionResult = await racingAction?.() ?? undefined;
     } finally {
@@ -189,7 +199,7 @@ ${code.join('\n')}
 
     result.push(
         `- Page URL: ${tab.page.url()}`,
-        `- Page Title: ${await tab.page.title()}`
+        `- Page Title: ${await tab.title()}`
     );
 
     if (captureSnapshot && tab.hasSnapshot())
@@ -209,10 +219,14 @@ ${code.join('\n')}
   }
 
   async waitForTimeout(time: number) {
-    if (this._currentTab && !this._javaScriptBlocked())
-      await this._currentTab.page.evaluate(() => new Promise(f => setTimeout(f, 1000)));
-    else
+    if (!this._currentTab || this._javaScriptBlocked()) {
       await new Promise(f => setTimeout(f, time));
+      return;
+    }
+
+    await callOnPageNoTrace(this._currentTab.page, page => {
+      return page.evaluate(() => new Promise(f => setTimeout(f, 1000)));
+    });
   }
 
   private async _raceAgainstModalDialogs(action: () => Promise<ToolActionResult>): Promise<ToolActionResult> {
@@ -272,22 +286,24 @@ ${code.join('\n')}
 
     if (this._currentTab === tab)
       this._currentTab = this._tabs[Math.min(index, this._tabs.length - 1)];
-    if (this._browserContext && !this._tabs.length)
+    if (!this._tabs.length)
       void this.close();
   }
 
   async close() {
-    if (!this._browserContext)
+    if (!this._browserContextPromise)
       return;
-    const browserContext = this._browserContext;
-    const browser = this._browser;
-    this._createBrowserContextPromise = undefined;
-    this._browserContext = undefined;
-    this._browser = undefined;
 
-    await browserContext?.close().then(async () => {
-      await browser?.close();
-    }).catch(() => {});
+    testDebug('close context');
+
+    const promise = this._browserContextPromise;
+    this._browserContextPromise = undefined;
+
+    await promise.then(async ({ browserContext, close }) => {
+      if (this.config.saveTrace)
+        await browserContext.tracing.stop();
+      await close();
+    });
   }
 
   private async _setupRequestInterception(context: playwright.BrowserContext) {
@@ -304,80 +320,32 @@ ${code.join('\n')}
     }
   }
 
-  private async _ensureBrowserContext() {
-    if (!this._browserContext) {
-      const context = await this._createBrowserContext();
-      this._browser = context.browser;
-      this._browserContext = context.browserContext;
-      await this._setupRequestInterception(this._browserContext);
-      for (const page of this._browserContext.pages())
-        this._onPageCreated(page);
-      this._browserContext.on('page', page => this._onPageCreated(page));
-    }
-    return this._browserContext;
-  }
-
-  private async _createBrowserContext(): Promise<{ browser?: playwright.Browser, browserContext: playwright.BrowserContext }> {
-    if (!this._createBrowserContextPromise) {
-      this._createBrowserContextPromise = this._innerCreateBrowserContext();
-      void this._createBrowserContextPromise.catch(() => {
-        this._createBrowserContextPromise = undefined;
+  private _ensureBrowserContext() {
+    if (!this._browserContextPromise) {
+      this._browserContextPromise = this._setupBrowserContext();
+      this._browserContextPromise.catch(() => {
+        this._browserContextPromise = undefined;
       });
     }
-    return this._createBrowserContextPromise;
+    return this._browserContextPromise;
   }
 
-  private async _innerCreateBrowserContext(): Promise<{ browser?: playwright.Browser, browserContext: playwright.BrowserContext }> {
-    if (this.config.browser?.remoteEndpoint) {
-      const url = new URL(this.config.browser?.remoteEndpoint);
-      if (this.config.browser.browserName)
-        url.searchParams.set('browser', this.config.browser.browserName);
-      if (this.config.browser.launchOptions)
-        url.searchParams.set('launch-options', JSON.stringify(this.config.browser.launchOptions));
-      const browser = await playwright[this.config.browser?.browserName ?? 'chromium'].connect(String(url));
-      const browserContext = await browser.newContext();
-      return { browser, browserContext };
+  private async _setupBrowserContext(): Promise<{ browserContext: playwright.BrowserContext, close: () => Promise<void> }> {
+    // TODO: move to the browser context factory to make it based on isolation mode.
+    const result = await this._browserContextFactory.createContext();
+    const { browserContext } = result;
+    await this._setupRequestInterception(browserContext);
+    for (const page of browserContext.pages())
+      this._onPageCreated(page);
+    browserContext.on('page', page => this._onPageCreated(page));
+    if (this.config.saveTrace) {
+      await browserContext.tracing.start({
+        name: 'trace',
+        screenshots: false,
+        snapshots: true,
+        sources: false,
+      });
     }
-
-    if (this.config.browser?.cdpEndpoint) {
-      const browser = await playwright.chromium.connectOverCDP(this.config.browser.cdpEndpoint);
-      const browserContext = browser.contexts()[0];
-      return { browser, browserContext };
-    }
-
-    const browserContext = await launchPersistentContext(this.config.browser);
-    return { browserContext };
+    return result;
   }
-}
-
-async function launchPersistentContext(browserConfig: Config['browser']): Promise<playwright.BrowserContext> {
-  try {
-    const browserName = browserConfig?.browserName ?? 'chromium';
-    const userDataDir = browserConfig?.userDataDir ?? await createUserDataDir({ ...browserConfig, browserName });
-    const browserType = playwright[browserName];
-    return await browserType.launchPersistentContext(userDataDir, { ...browserConfig?.launchOptions, ...browserConfig?.contextOptions });
-  } catch (error: any) {
-    if (error.message.includes('Executable doesn\'t exist'))
-      throw new Error(`Browser specified in your config is not installed. Either install it (likely) or change the config.`);
-    throw error;
-  }
-}
-
-async function createUserDataDir(browserConfig: Config['browser']) {
-  let cacheDirectory: string;
-  if (process.platform === 'linux')
-    cacheDirectory = process.env.XDG_CACHE_HOME || path.join(os.homedir(), '.cache');
-  else if (process.platform === 'darwin')
-    cacheDirectory = path.join(os.homedir(), 'Library', 'Caches');
-  else if (process.platform === 'win32')
-    cacheDirectory = process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local');
-  else
-    throw new Error('Unsupported platform: ' + process.platform);
-  const result = path.join(cacheDirectory, 'ms-playwright', `mcp-${browserConfig?.launchOptions.channel ?? browserConfig?.browserName}-profile`);
-  await fs.promises.mkdir(result, { recursive: true });
-  return result;
-}
-
-export async function generateLocator(locator: playwright.Locator): Promise<string> {
-  return (locator as any)._generateLocatorString();
 }

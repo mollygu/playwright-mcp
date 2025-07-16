@@ -17,13 +17,14 @@
 import * as playwright from 'playwright';
 
 import { PageSnapshot } from './pageSnapshot.js';
+import { callOnPageNoTrace } from './tools/utils.js';
 
 import type { Context } from './context.js';
 
 export class Tab {
   readonly context: Context;
   readonly page: playwright.Page;
-  private _console: playwright.ConsoleMessage[] = [];
+  private _consoleMessages: ConsoleMessage[] = [];
   private _requests: Map<playwright.Request, playwright.Response | null> = new Map();
   private _snapshot: PageSnapshot | undefined;
   private _onPageClose: (tab: Tab) => void;
@@ -32,13 +33,10 @@ export class Tab {
     this.context = context;
     this.page = page;
     this._onPageClose = onPageClose;
-    page.on('console', event => this._console.push(event));
+    page.on('console', event => this._consoleMessages.push(messageToConsoleMessage(event)));
+    page.on('pageerror', error => this._consoleMessages.push(pageErrorToConsoleMessage(error)));
     page.on('request', request => this._requests.set(request, null));
     page.on('response', response => this._requests.set(response.request(), response));
-    page.on('framenavigated', frame => {
-      if (!frame.parentFrame())
-        this._clearCollectedArtifacts();
-    });
     page.on('close', () => this._onClose());
     page.on('filechooser', chooser => {
       this.context.setModalState({
@@ -56,7 +54,7 @@ export class Tab {
   }
 
   private _clearCollectedArtifacts() {
-    this._console.length = 0;
+    this._consoleMessages.length = 0;
     this._requests.clear();
   }
 
@@ -65,10 +63,38 @@ export class Tab {
     this._onPageClose(this);
   }
 
+  async title(): Promise<string> {
+    return await callOnPageNoTrace(this.page, page => page.title());
+  }
+
+  async waitForLoadState(state: 'load', options?: { timeout?: number }): Promise<void> {
+    await callOnPageNoTrace(this.page, page => page.waitForLoadState(state, options).catch(() => {}));
+  }
+
   async navigate(url: string) {
-    await this.page.goto(url, { waitUntil: 'domcontentloaded' });
+    this._clearCollectedArtifacts();
+
+    const downloadEvent = callOnPageNoTrace(this.page, page => page.waitForEvent('download').catch(() => {}));
+    try {
+      await this.page.goto(url, { waitUntil: 'domcontentloaded' });
+    } catch (_e: unknown) {
+      const e = _e as Error;
+      const mightBeDownload =
+        e.message.includes('net::ERR_ABORTED') // chromium
+        || e.message.includes('Download is starting'); // firefox + webkit
+      if (!mightBeDownload)
+        throw e;
+      // on chromium, the download event is fired *after* page.goto rejects, so we wait a lil bit
+      const download = await Promise.race([
+        downloadEvent,
+        new Promise(resolve => setTimeout(resolve, 1000)),
+      ]);
+      if (!download)
+        throw e;
+    }
+
     // Cap load event to 5 seconds, the page is operational at this point.
-    await this.page.waitForLoadState('load', { timeout: 5000 }).catch(() => {});
+    await this.waitForLoadState('load', { timeout: 5000 });
   }
 
   hasSnapshot(): boolean {
@@ -81,8 +107,8 @@ export class Tab {
     return this._snapshot;
   }
 
-  console(): playwright.ConsoleMessage[] {
-    return this._console;
+  consoleMessages(): ConsoleMessage[] {
+    return this._consoleMessages;
   }
 
   requests(): Map<playwright.Request, playwright.Response | null> {
@@ -92,4 +118,33 @@ export class Tab {
   async captureSnapshot() {
     this._snapshot = await PageSnapshot.create(this.page);
   }
+}
+
+export type ConsoleMessage = {
+  type: ReturnType<playwright.ConsoleMessage['type']> | undefined;
+  text: string;
+  toString(): string;
+};
+
+function messageToConsoleMessage(message: playwright.ConsoleMessage): ConsoleMessage {
+  return {
+    type: message.type(),
+    text: message.text(),
+    toString: () => `[${message.type().toUpperCase()}] ${message.text()} @ ${message.location().url}:${message.location().lineNumber}`,
+  };
+}
+
+function pageErrorToConsoleMessage(errorOrValue: Error | any): ConsoleMessage {
+  if (errorOrValue instanceof Error) {
+    return {
+      type: undefined,
+      text: errorOrValue.message,
+      toString: () => errorOrValue.stack || errorOrValue.message,
+    };
+  }
+  return {
+    type: undefined,
+    text: String(errorOrValue),
+    toString: () => String(errorOrValue),
+  };
 }

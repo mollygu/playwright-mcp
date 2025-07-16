@@ -18,9 +18,7 @@ import { z } from 'zod';
 
 import { defineTool } from './tool.js';
 import * as javascript from '../javascript.js';
-import { outputFile } from '../config.js';
-
-import type * as playwright from 'playwright';
+import { generateLocator } from './utils.js';
 
 const snapshot = defineTool({
   capability: 'core',
@@ -48,28 +46,36 @@ const elementSchema = z.object({
   ref: z.string().describe('Exact target element reference from the page snapshot'),
 });
 
+const clickSchema = elementSchema.extend({
+  doubleClick: z.boolean().optional().describe('Whether to perform a double click instead of a single click'),
+});
+
 const click = defineTool({
   capability: 'core',
   schema: {
     name: 'browser_click',
     title: 'Click',
     description: 'Perform click on a web page',
-    inputSchema: elementSchema,
+    inputSchema: clickSchema,
     type: 'destructive',
   },
 
   handle: async (context, params) => {
     const tab = context.currentTabOrDie();
-    const locator = tab.snapshotOrDie().refLocator(params.ref);
+    const locator = tab.snapshotOrDie().refLocator(params);
 
-    const code = [
-      `// Click ${params.element}`,
-      `await page.${await generateLocator(locator)}.click();`
-    ];
+    const code: string[] = [];
+    if (params.doubleClick) {
+      code.push(`// Double click ${params.element}`);
+      code.push(`await page.${await generateLocator(locator)}.dblclick();`);
+    } else {
+      code.push(`// Click ${params.element}`);
+      code.push(`await page.${await generateLocator(locator)}.click();`);
+    }
 
     return {
       code,
-      action: () => locator.click(),
+      action: () => params.doubleClick ? locator.dblclick() : locator.click(),
       captureSnapshot: true,
       waitForNetwork: true,
     };
@@ -93,8 +99,8 @@ const drag = defineTool({
 
   handle: async (context, params) => {
     const snapshot = context.currentTabOrDie().snapshotOrDie();
-    const startLocator = snapshot.refLocator(params.startRef);
-    const endLocator = snapshot.refLocator(params.endRef);
+    const startLocator = snapshot.refLocator({ ref: params.startRef, element: params.startElement });
+    const endLocator = snapshot.refLocator({ ref: params.endRef, element: params.endElement });
 
     const code = [
       `// Drag ${params.startElement} to ${params.endElement}`,
@@ -122,7 +128,7 @@ const hover = defineTool({
 
   handle: async (context, params) => {
     const snapshot = context.currentTabOrDie().snapshotOrDie();
-    const locator = snapshot.refLocator(params.ref);
+    const locator = snapshot.refLocator(params);
 
     const code = [
       `// Hover over ${params.element}`,
@@ -156,7 +162,7 @@ const type = defineTool({
 
   handle: async (context, params) => {
     const snapshot = context.currentTabOrDie().snapshotOrDie();
-    const locator = snapshot.refLocator(params.ref);
+    const locator = snapshot.refLocator(params);
 
     const code: string[] = [];
     const steps: (() => Promise<void>)[] = [];
@@ -202,7 +208,7 @@ const selectOption = defineTool({
 
   handle: async (context, params) => {
     const snapshot = context.currentTabOrDie().snapshotOrDie();
-    const locator = snapshot.refLocator(params.ref);
+    const locator = snapshot.refLocator(params);
 
     const code = [
       `// Select options [${params.values.join(', ')}] in ${params.element}`,
@@ -218,71 +224,6 @@ const selectOption = defineTool({
   },
 });
 
-const screenshotSchema = z.object({
-  raw: z.boolean().optional().describe('Whether to return without compression (in PNG format). Default is false, which returns a JPEG image.'),
-  element: z.string().optional().describe('Human-readable element description used to obtain permission to screenshot the element. If not provided, the screenshot will be taken of viewport. If element is provided, ref must be provided too.'),
-  ref: z.string().optional().describe('Exact target element reference from the page snapshot. If not provided, the screenshot will be taken of viewport. If ref is provided, element must be provided too.'),
-}).refine(data => {
-  return !!data.element === !!data.ref;
-}, {
-  message: 'Both element and ref must be provided or neither.',
-  path: ['ref', 'element']
-});
-
-const screenshot = defineTool({
-  capability: 'core',
-  schema: {
-    name: 'browser_take_screenshot',
-    title: 'Take a screenshot',
-    description: `Take a screenshot of the current page. You can't perform actions based on the screenshot, use browser_snapshot for actions.`,
-    inputSchema: screenshotSchema,
-    type: 'readOnly',
-  },
-
-  handle: async (context, params) => {
-    const tab = context.currentTabOrDie();
-    const snapshot = tab.snapshotOrDie();
-    const fileType = params.raw ? 'png' : 'jpeg';
-    const fileName = await outputFile(context.config, `page-${new Date().toISOString()}.${fileType}`);
-    const options: playwright.PageScreenshotOptions = { type: fileType, quality: fileType === 'png' ? undefined : 50, scale: 'css', path: fileName };
-    const isElementScreenshot = params.element && params.ref;
-
-    const code = [
-      `// Screenshot ${isElementScreenshot ? params.element : 'viewport'} and save it as ${fileName}`,
-    ];
-
-    const locator = params.ref ? snapshot.refLocator(params.ref) : null;
-
-    if (locator)
-      code.push(`await page.${await generateLocator(locator)}.screenshot(${javascript.formatObject(options)});`);
-    else
-      code.push(`await page.screenshot(${javascript.formatObject(options)});`);
-
-    const includeBase64 = !context.config.noImageResponses;
-    const action = async () => {
-      const screenshot = locator ? await locator.screenshot(options) : await tab.page.screenshot(options);
-      return {
-        content: includeBase64 ? [{
-          type: 'image' as 'image',
-          data: screenshot.toString('base64'),
-          mimeType: fileType === 'png' ? 'image/png' : 'image/jpeg',
-        }] : []
-      };
-    };
-
-    return {
-      code,
-      action,
-      captureSnapshot: true,
-      waitForNetwork: false,
-    };
-  }
-});
-
-export async function generateLocator(locator: playwright.Locator): Promise<string> {
-  return (locator as any)._generateLocatorString();
-}
-
 export default [
   snapshot,
   click,
@@ -290,5 +231,4 @@ export default [
   hover,
   type,
   selectOption,
-  screenshot,
 ];

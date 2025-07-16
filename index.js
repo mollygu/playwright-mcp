@@ -15,5 +15,5 @@
  * limitations under the License.
  */
 
-import { createConnection } from './lib/index';
-export default { createConnection };
+import { createConnection } from './lib/index.js';
+export { createConnection };

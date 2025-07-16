@@ -14,23 +14,9 @@
  * limitations under the License.
  */
 
-import type { Context } from '../context.js';
+import fs from 'node:fs';
+import url from 'node:url';
+import path from 'node:path';
 
-export type ResourceSchema = {
-  uri: string;
-  name: string;
-  description?: string;
-  mimeType?: string;
-};
-
-export type ResourceResult = {
-  uri: string;
-  mimeType?: string;
-  text?: string;
-  blob?: string;
-};
-
-export type Resource = {
-  schema: ResourceSchema;
-  read: (context: Context, uri: string) => Promise<ResourceResult[]>;
-};
+const __filename = url.fileURLToPath(import.meta.url);
+export const packageJSON = JSON.parse(fs.readFileSync(path.join(path.dirname(__filename), '..', 'package.json'), 'utf8'));
